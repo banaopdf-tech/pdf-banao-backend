@@ -86,7 +86,7 @@ app.post("/convert/to-pdf", upload.single("file"), async (req, res) => {
   }
 });
 
-// ---- PDF -> Office document (PDF -> Word/PowerPoint) ----
+// ---- PDF -> Office document / eBook (Word, PowerPoint, RTF, EPUB) ----
 // NOTE: PDF -> Excel is intentionally not offered. LibreOffice has no
 // working PDF-to-Calc importer (verified: the only candidate filter,
 // calc_pdf_addstream_import, fails to even load the source file) — Excel
@@ -96,6 +96,13 @@ app.post("/convert/to-pdf", upload.single("file"), async (req, res) => {
 const PDF_TARGETS = {
   word: { ext: "docx", mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", infilter: "writer_pdf_import" },
   powerpoint: { ext: "pptx", mime: "application/vnd.openxmlformats-officedocument.presentationml.presentation", infilter: "impress_pdf_import" },
+  // RTF and EPUB come out of the same Writer pipeline as docx: the PDF is
+  // imported with writer_pdf_import and then written back out through a
+  // different Writer export filter. Both filters ship with the
+  // libreoffice-writer package already in the Dockerfile, so this needs no
+  // new dependency and no larger image.
+  rtf: { ext: "rtf", mime: "application/rtf", infilter: "writer_pdf_import" },
+  epub: { ext: "epub", mime: "application/epub+zip", infilter: "writer_pdf_import" },
 };
 app.post("/convert/from-pdf/:target", upload.single("file"), async (req, res) => {
   const target = PDF_TARGETS[req.params.target];
