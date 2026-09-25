@@ -1,7 +1,7 @@
 {
   "name": "pdf-banao-backend",
   "version": "1.0.0",
-  "description": "PDF Banao backend - Office<->PDF conversion (LibreOffice) and PDF unlock/protect (qpdf)",
+  "description": "PDF Banao backend - Office<->PDF conversion (LibreOffice), PDF unlock/protect (qpdf), traffic stats for the admin panel",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -12,6 +12,8 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
+    "fast-geoip": "^1.1.88",
+    "geoip-country": "^5.0.202609230144",
     "multer": "^1.4.5-lts.1"
   },
   "license": "ISC"
