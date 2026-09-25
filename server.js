@@ -183,9 +183,14 @@ app.post("/pdf/protect", upload.single("file"), async (req, res) => {
 // org). The backend talks to it with the project's PUBLISHABLE key, which is
 // meant to be public: the tables themselves are closed, and the only way in is
 // a handful of database functions (pb_track, pb_admin_login, pb_admin_stats,
-// pb_admin_password, pb_admin_logout) that do their own checks. The admin
-// password is a bcrypt hash inside the database and is changed from the admin
-// panel — nothing secret has to be set on Render.
+// pb_admin_password, pb_admin_logout) that do their own checks.
+//
+// Admin login: the username and password set in Render -> Environment
+// (ADMIN_USER / ADMIN_PASSWORD; a few other common names are accepted too).
+// The database keeps a bcrypt hash of the same password and only opens the
+// statistics for it. The first login after a new password is set on Render
+// links the two once, with the previous password (the setup code the first
+// time). Without a password on Render the database password alone is used.
 // ======================================================================
 const geoCountry = require("geoip-country");  // IPv4 + IPv6, country only, ~13 MB of memory
 const geoCity = require("fast-geoip");        // IPv4 state/city, read lazily from disk
@@ -193,6 +198,11 @@ const geoCity = require("fast-geoip");        // IPv4 state/city, read lazily fr
 const SUPABASE_URL = (process.env.SUPABASE_URL || "https://jbzssifupzyazzddgwjl.supabase.co").replace(/\/+$/, "");
 const SUPABASE_KEY = process.env.SUPABASE_KEY || "sb_publishable_QPkf2-orVWYG5JML-yHp_w_5rFa6FMi";
 const STATS_TZ = "Asia/Kolkata";
+
+/* the login set on Render; the first variable that exists wins */
+const envFirst = (names) => { for (const n of names) if (process.env[n]) return { name: n, value: String(process.env[n]) }; return null; };
+const ENV_USER = envFirst(["ADMIN_USER", "ADMIN_USERNAME", "ADMIN_NAME", "ADMIN_ID", "USERNAME"]);
+const ENV_PASS = envFirst(["ADMIN_PASSWORD", "ADMIN_PASS", "ADMIN_PWD", "PASSWORD"]);
 
 /* call one of the database functions; resolves to { ok, status, data } */
 async function rpc(name, args) {
@@ -336,22 +346,59 @@ app.post("/t", express.text({ type: "*/*", limit: "4kb" }), async (req, res) => 
 /* ---- admin panel ---- */
 const bearer = (req) => String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").slice(0, 200);
 
-app.get("/admin/status", (req, res) => res.json({ password: true, database: !!SUPABASE_KEY }));
+const sameSecret = (x, y) => crypto.timingSafeEqual(
+  crypto.createHash("sha256").update(String(x)).digest(), crypto.createHash("sha256").update(String(y)).digest());
+
+/* names only, never values: lets the panel say what Render is providing */
+app.get("/admin/status", (req, res) => res.json({
+  mode: ENV_PASS ? "env" : "db", userVar: ENV_USER ? ENV_USER.name : null, passVar: ENV_PASS ? ENV_PASS.name : null,
+  password: true, database: !!SUPABASE_KEY,
+}));
 
 app.post("/admin/login", express.json({ limit: "2kb" }), async (req, res) => {
   const ip = clientIp(req);
   if (tooMany("login|" + ip, 8, 15 * 60e3)) return res.status(429).json({ error: "Bahut baar galat try hua. 15 minute baad dobara karo." });
-  const { user, password } = req.body || {};
+  const user = String((req.body || {}).user || "").trim().slice(0, 60);
+  const password = String((req.body || {}).password || "").slice(0, 100);
+  const setup = String((req.body || {}).setup || "").slice(0, 100);
+  const fail = (code, error, extra) => res.status(code).json(Object.assign({ error }, extra || {}));
   try {
-    const r = await rpc("pb_admin_login", { p_user: String(user || "").slice(0, 60), p_pass: String(password || "").slice(0, 100) });
-    const d = r.data || {};
-    if (!r.ok) return res.status(502).json({ error: "Database se jawab nahi aaya (" + r.status + ")." });
-    if (d.error === "locked") return res.status(429).json({ error: "Bahut baar galat password dala gaya. 15 minute baad try karo." });
-    if (d.error || !d.token) return res.status(401).json({ error: "Username ya password galat hai." });
+    if (!ENV_PASS) {
+      // no login on Render: the database password is the login
+      const r = await rpc("pb_admin_login", { p_user: user, p_pass: password });
+      const d = r.data || {};
+      if (!r.ok) return fail(502, "Database se jawab nahi aaya (" + r.status + ").");
+      if (d.error === "locked") return fail(429, "Bahut baar galat password dala gaya. 15 minute baad try karo.");
+      if (d.error || !d.token) return fail(401, "Username ya password galat hai.");
+      hits.delete("login|" + ip);
+      return res.json({ token: d.token, user: d.user, mustChange: !!d.must_change, mode: "db" });
+    }
+
+    // the login on Render decides who gets in
+    const wantUser = ENV_USER ? ENV_USER.value : "admin";
+    if (!sameSecret(user.toLowerCase(), wantUser.trim().toLowerCase()) || !sameSecret(password, ENV_PASS.value)) {
+      return fail(401, "Username ya password galat hai.");
+    }
     hits.delete("login|" + ip);
-    res.json({ token: d.token, user: d.user, mustChange: !!d.must_change });
+    let r = await rpc("pb_admin_login", { p_user: "admin", p_pass: ENV_PASS.value });
+    if (!r.ok) return fail(502, "Database se jawab nahi aaya (" + r.status + ").");
+    if (r.data && r.data.error === "locked") return fail(429, "Bahut baar galat password dala gaya. 15 minute baad try karo.");
+    if (r.data && r.data.token) return res.json({ token: r.data.token, user: wantUser, mustChange: false, mode: "env" });
+
+    // Render has a password the database does not know yet: link them once,
+    // with the password the database had before (the setup code, first time)
+    if (!setup) return fail(409, "Ek baar pichhla admin password chahiye.", { needSetup: true });
+    const old = await rpc("pb_admin_login", { p_user: "admin", p_pass: setup });
+    if (!old.ok || !old.data || !old.data.token) return fail(401, "Pichhla password galat hai.", { needSetup: true });
+    const ch = await rpc("pb_admin_password", { p_token: old.data.token, p_old: setup, p_new: ENV_PASS.value });
+    const e = ch.data && ch.data.error;
+    if (e === "length") return fail(400, "Render wala password 8 se 72 akshar ka hona chahiye. Render par badal ke dobara try karo.");
+    if (!ch.ok || (e && e !== "same")) return fail(400, "Jod nahi paye. Dobara try karo.", { needSetup: true });
+    r = await rpc("pb_admin_login", { p_user: "admin", p_pass: ENV_PASS.value });
+    if (!r.data || !r.data.token) return fail(502, "Jod diya, par login nahi hua. Dobara try karo.");
+    res.json({ token: r.data.token, user: wantUser, mustChange: false, mode: "env", linked: true });
   } catch (err) {
-    res.status(502).json({ error: "Database tak nahi pahunch paye." });
+    fail(502, "Database tak nahi pahunch paye.");
   }
 });
 
@@ -359,6 +406,7 @@ app.post("/admin/password", express.json({ limit: "2kb" }), async (req, res) => 
   const ip = clientIp(req);
   if (tooMany("pw|" + ip, 10, 15 * 60e3)) return res.status(429).json({ error: "Bahut baar try hua. 15 minute baad dobara karo." });
   const { oldPassword, newPassword } = req.body || {};
+  if (ENV_PASS) return res.status(400).json({ error: "Password Render par set hai — wahin Environment me badlo." });
   try {
     const r = await rpc("pb_admin_password", { p_token: bearer(req), p_old: String(oldPassword || ""), p_new: String(newPassword || "") });
     const d = r.data || {};
