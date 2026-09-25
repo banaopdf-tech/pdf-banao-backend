@@ -200,9 +200,26 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY || "sb_publishable_QPkf2-orVWYG5JM
 const STATS_TZ = "Asia/Kolkata";
 
 /* the login set on Render; the first variable that exists wins */
-const envFirst = (names) => { for (const n of names) if (process.env[n]) return { name: n, value: String(process.env[n]) }; return null; };
-const ENV_USER = envFirst(["ADMIN_USER", "ADMIN_USERNAME", "ADMIN_NAME", "ADMIN_ID", "USERNAME"]);
-const ENV_PASS = envFirst(["ADMIN_PASSWORD", "ADMIN_PASS", "ADMIN_PWD", "PASSWORD"]);
+/* The first listed name that exists wins; failing that, any variable whose
+   name matches the pattern, ignoring case (people type "Admin_Password",
+   "admin password", "PASSWORD"...). Values are trimmed. */
+const envFirst = (names, pattern) => {
+  for (const n of names) if (process.env[n] && process.env[n].trim()) return { name: n, value: process.env[n].trim() };
+  if (pattern) {
+    const hit = Object.keys(process.env).sort().find((n) => pattern.test(n) && process.env[n] && process.env[n].trim());
+    if (hit) return { name: hit, value: process.env[hit].trim() };
+  }
+  return null;
+};
+const ENV_USER = envFirst(["ADMIN_USER", "ADMIN_USERNAME", "ADMIN_NAME", "ADMIN_ID", "USERNAME"],
+  // never bare USER / NAME / ID: a container sets some of those itself
+  /^(admin[\s_.-]*(user([\s_.-]*(name|id))?|name|id|login|email)|user[\s_.-]*name|login([\s_.-]*id)?)$/i);
+const ENV_PASS = envFirst(["ADMIN_PASSWORD", "ADMIN_PASS", "ADMIN_PWD", "PASSWORD"],
+  // never bare PWD: that is the shell's working directory, not a password
+  /^(admin[\s_.-]*(pass(word)?|pwd|passcode)|pass(word)?|passcode)$/i);
+/* names (never values) of variables that look like they were meant for this,
+   so the admin panel can say what Render is actually handing over */
+const envLookalikes = () => Object.keys(process.env).filter((n) => /user|pass|pwd|admin|login|razor|rzp/i.test(n)).sort();
 
 /* call one of the database functions; resolves to { ok, status, data } */
 async function rpc(name, args) {
@@ -352,6 +369,7 @@ const sameSecret = (x, y) => crypto.timingSafeEqual(
 /* names only, never values: lets the panel say what Render is providing */
 app.get("/admin/status", (req, res) => res.json({
   mode: ENV_PASS ? "env" : "db", userVar: ENV_USER ? ENV_USER.name : null, passVar: ENV_PASS ? ENV_PASS.name : null,
+  seen: envLookalikes(),
   password: true, database: !!SUPABASE_KEY,
 }));
 
@@ -458,6 +476,213 @@ app.get("/admin/stats", async (req, res) => {
   } catch (err) {
     res.status(502).json({ error: "Database tak nahi pahunch paye." });
   }
+});
+
+// ======================================================================
+// Paid tools, user accounts and Razorpay
+// ----------------------------------------------------------------------
+// Prices and free limits are set in the admin panel (table pb_tool_price).
+// A paid tool can be used freely; its download asks /paid/use, which allows
+// it with an active pass, a bought single download, or while the free uses
+// of the window last. After that the site asks the visitor to register /
+// log in and pay: a pass (30 days / 365 days / life) or one download.
+//
+// Every payment is a one-time Razorpay order. The amount always comes from
+// the database, never from the browser, and access is granted only after
+// Razorpay's signature checks out with the secret key. Render -> Environment:
+//   RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET   (RAZORPAY_WEBHOOK_SECRET optional)
+// Granting access also needs the backend's database key, which is the admin
+// password on Render (the first admin login links it to the database).
+// ======================================================================
+const RZP_ID = envFirst(["RAZORPAY_KEY_ID", "RAZORPAY_KEY", "RAZORPAY_API_KEY", "RAZORPAY_ID", "RAZORPAY_KEYID"],
+  /^(razorpay|rzp)[\s_.-]*(api[\s_.-]*)?(key[\s_.-]*)?id$|^(razorpay|rzp)[\s_.-]*(api[\s_.-]*)?key$/i);
+const RZP_SECRET = envFirst(["RAZORPAY_KEY_SECRET", "RAZORPAY_SECRET", "RAZORPAY_SECRET_KEY", "RAZORPAY_API_SECRET", "RAZORPAY_KEYSECRET"],
+  /^(razorpay|rzp)[\s_.-]*(api[\s_.-]*)?(key[\s_.-]*)?secret([\s_.-]*key)?$/i);
+const RZP_WEBHOOK = envFirst(["RAZORPAY_WEBHOOK_SECRET"]);
+const payReady = () => !!(RZP_ID && RZP_SECRET);
+const dbKey = () => (ENV_PASS ? ENV_PASS.value : "");
+
+let paidCache = { at: 0, data: null };
+async function paidConfig() {
+  if (paidCache.data && Date.now() - paidCache.at < 60e3) return paidCache.data;
+  const r = await rpc("pb_paid_config", {});
+  if (!r.ok || !Array.isArray(r.data)) throw new Error("config " + r.status);
+  paidCache = { at: Date.now(), data: r.data };
+  return r.data;
+}
+
+app.get("/paid/config", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try { res.json({ tools: await paidConfig(), payments: payReady() }); }
+  catch (err) { res.status(502).json({ error: "config", tools: [] }); }
+});
+
+/* may this download go ahead? */
+app.post("/paid/use", express.json({ limit: "2kb" }), async (req, res) => {
+  const ip = clientIp(req);
+  if (tooMany("use|" + ip, 60, 60e3)) return res.status(429).json({ allowed: false, error: "Thodi der baad try karo." });
+  const tool = String((req.body || {}).tool || "").slice(0, 60);
+  const device = String((req.body || {}).device || "").slice(0, 80);
+  if (!/^[a-z0-9-]{2,60}$/.test(tool)) return res.json({ allowed: true, reason: "unknown-tool" });
+  try {
+    const r = await rpc("pb_use", { p_tool: tool, p_device: device || ip, p_ip: ip, p_user_token: bearer(req) });
+    if (!r.ok || !r.data) return res.status(502).json({ allowed: true, reason: "db-down" });   // never block on our own outage
+    res.json(Object.assign({ payments: payReady() }, r.data));
+  } catch (err) {
+    res.status(502).json({ allowed: true, reason: "db-down" });
+  }
+});
+
+/* ---- visitor accounts ---- */
+const USER_ERRORS = {
+  name: "Apna naam likho.", mobile: "10 ank ka sahi mobile number daalo.", email: "Sahi email id daalo.",
+  password: "Password 8 se 72 akshar ka rakho.", exists: "Is email se account pehle se hai — Login karo.",
+  bad: "Email ya password galat hai.", locked: "Bahut baar galat password. 15 minute baad try karo.", auth: "Dobara login karo.",
+};
+app.post("/user/register", express.json({ limit: "2kb" }), async (req, res) => {
+  const ip = clientIp(req);
+  if (tooMany("reg|" + ip, 10, 60 * 60e3)) return res.status(429).json({ error: "Bahut saare account ban gaye. Thodi der baad try karo." });
+  const b = req.body || {};
+  try {
+    const r = await rpc("pb_user_register", { p_name: String(b.name || "").slice(0, 80), p_mobile: String(b.mobile || "").slice(0, 20),
+      p_email: String(b.email || "").slice(0, 120), p_pass: String(b.password || "").slice(0, 100) });
+    const d = r.data || {};
+    if (!r.ok) return res.status(502).json({ error: "Server se jawab nahi aaya. Dobara try karo." });
+    if (d.error) return res.status(400).json({ error: USER_ERRORS[d.error] || "Account nahi bana.", field: d.error });
+    res.json(d);
+  } catch (err) { res.status(502).json({ error: "Server tak nahi pahunch paye." }); }
+});
+app.post("/user/login", express.json({ limit: "2kb" }), async (req, res) => {
+  const ip = clientIp(req);
+  if (tooMany("ulogin|" + ip, 20, 15 * 60e3)) return res.status(429).json({ error: USER_ERRORS.locked });
+  const b = req.body || {};
+  try {
+    const r = await rpc("pb_user_login", { p_email: String(b.email || "").slice(0, 120), p_pass: String(b.password || "").slice(0, 100) });
+    const d = r.data || {};
+    if (!r.ok) return res.status(502).json({ error: "Server se jawab nahi aaya. Dobara try karo." });
+    if (d.error) return res.status(d.error === "locked" ? 429 : 401).json({ error: USER_ERRORS[d.error] || "Login nahi hua." });
+    res.json(d);
+  } catch (err) { res.status(502).json({ error: "Server tak nahi pahunch paye." }); }
+});
+app.get("/user/me", async (req, res) => {
+  try {
+    const r = await rpc("pb_user_me", { p_token: bearer(req) });
+    if (!r.ok) return res.status(502).json({ error: "Server se jawab nahi aaya." });
+    if (r.data && r.data.error) return res.status(401).json({ error: USER_ERRORS.auth });
+    res.json(r.data);
+  } catch (err) { res.status(502).json({ error: "Server tak nahi pahunch paye." }); }
+});
+app.post("/user/logout", async (req, res) => {
+  try { await rpc("pb_user_logout", { p_token: bearer(req) }); } catch (e) {}
+  res.json({ ok: true });
+});
+
+/* ---- Razorpay ---- */
+function razorpay(pathname, body) {
+  const auth = Buffer.from(RZP_ID.value + ":" + RZP_SECRET.value).toString("base64");
+  return fetch((process.env.RAZORPAY_API_BASE || "https://api.razorpay.com/v1") + pathname, {
+    method: "POST", headers: { "Content-Type": "application/json", Authorization: "Basic " + auth }, body: JSON.stringify(body),
+  });
+}
+
+app.post("/pay/order", express.json({ limit: "2kb" }), async (req, res) => {
+  const ip = clientIp(req);
+  if (tooMany("order|" + ip, 20, 15 * 60e3)) return res.status(429).json({ error: "Thodi der baad try karo." });
+  if (!payReady()) return res.status(503).json({ error: "Payment abhi band hai — admin ko Render par Razorpay keys daalni hain." });
+  if (!ENV_PASS) return res.status(503).json({ error: "Payment abhi band hai — Render par ADMIN_PASSWORD chahiye." });
+  const tool = String((req.body || {}).tool || "").slice(0, 60);
+  const kind = (req.body || {}).kind === "once" ? "once" : "pass";
+  const receipt = "pb_" + Date.now().toString(36) + crypto.randomBytes(5).toString("hex");
+  try {
+    const st = await rpc("pb_order_start", { p_key: dbKey(), p_user_token: bearer(req), p_tool: tool, p_receipt: receipt, p_kind: kind });
+    const d = st.data || {};
+    if (!st.ok) return res.status(502).json({ error: "Server se jawab nahi aaya." });
+    if (d.error === "auth") return res.status(401).json({ error: USER_ERRORS.auth });
+    if (d.error === "key") return res.status(503).json({ error: "Payment abhi setup ho raha hai — admin ko ek baar admin panel me login karna hai." });
+    if (d.error === "kind") return res.status(400).json({ error: "Is tool ke liye ye option abhi nahi hai." });
+    if (d.error) return res.status(400).json({ error: "Ye tool abhi paid nahi hai." });
+    const rz = await razorpay("/orders", { amount: d.amount, currency: "INR", receipt, notes: { tool, kind, email: d.user.email } });
+    const order = await rz.json().catch(() => ({}));
+    if (!rz.ok || !order.id) {
+      console.error("razorpay order failed", rz.status, JSON.stringify(order).slice(0, 300));
+      return res.status(502).json({ error: rz.status === 401 ? "Razorpay keys galat hain (admin check kare)." : "Razorpay se order nahi bana. Dobara try karo." });
+    }
+    await rpc("pb_order_attach", { p_key: dbKey(), p_receipt: receipt, p_order_id: order.id });
+    res.json({ orderId: order.id, amount: d.amount, currency: "INR", keyId: RZP_ID.value, toolName: d.toolName,
+      kind, period: d.period, user: d.user });
+  } catch (err) {
+    console.error("order error", err && err.message);
+    res.status(502).json({ error: "Payment shuru nahi ho paya. Dobara try karo." });
+  }
+});
+
+/* Razorpay's own proof that this payment is for this order */
+function signatureOk(orderId, paymentId, signature) {
+  if (!RZP_SECRET || !orderId || !paymentId || !signature) return false;
+  const want = crypto.createHmac("sha256", RZP_SECRET.value).update(orderId + "|" + paymentId).digest("hex");
+  return want.length === String(signature).length && crypto.timingSafeEqual(Buffer.from(want), Buffer.from(String(signature)));
+}
+
+app.post("/pay/verify", express.json({ limit: "2kb" }), async (req, res) => {
+  const b = req.body || {};
+  const orderId = String(b.orderId || "").slice(0, 60), paymentId = String(b.paymentId || "").slice(0, 60);
+  if (!signatureOk(orderId, paymentId, String(b.signature || "").slice(0, 200))) {
+    return res.status(400).json({ error: "Payment ki pushti nahi hui. Paise kate hon to humein email karo — hum jod denge." });
+  }
+  try {
+    const r = await rpc("pb_order_paid", { p_key: dbKey(), p_order_id: orderId, p_payment_id: paymentId });
+    const d = r.data || {};
+    if (!r.ok || d.error) {
+      console.error("order paid failed", r.status, JSON.stringify(d).slice(0, 200));
+      return res.status(502).json({ error: "Payment mil gaya, par account me judne me dikkat hui. Humein email karo — hum jod denge." });
+    }
+    const me = await rpc("pb_user_me", { p_token: bearer(req) });
+    res.json({ ok: true, tool: d.tool, kind: d.kind, subs: (me.data && me.data.subs) || d.subs || [] });
+  } catch (err) {
+    res.status(502).json({ error: "Payment mil gaya, par account me judne me dikkat hui. Thodi der me dobara try karo." });
+  }
+});
+
+/* optional: Razorpay tells us directly, in case the visitor closed the page */
+app.post("/pay/webhook", express.raw({ type: "*/*", limit: "100kb" }), async (req, res) => {
+  if (!RZP_WEBHOOK) return res.status(404).end();
+  const sig = String(req.headers["x-razorpay-signature"] || "");
+  const want = crypto.createHmac("sha256", RZP_WEBHOOK.value).update(req.body || "").digest("hex");
+  if (want.length !== sig.length || !crypto.timingSafeEqual(Buffer.from(want), Buffer.from(sig))) return res.status(400).end();
+  res.status(200).json({ ok: true });
+  try {
+    const ev = JSON.parse(req.body.toString("utf8"));
+    const pay = ev && ev.payload && ev.payload.payment && ev.payload.payment.entity;
+    if (pay && pay.order_id && (ev.event === "payment.captured" || ev.event === "order.paid")) {
+      await rpc("pb_order_paid", { p_key: dbKey(), p_order_id: pay.order_id, p_payment_id: pay.id });
+    }
+  } catch (err) { console.error("webhook error", err && err.message); }
+});
+
+/* ---- admin: paid tools ---- */
+app.get("/admin/tools", async (req, res) => {
+  try {
+    const r = await rpc("pb_admin_tools_get", { p_token: bearer(req) });
+    if (!r.ok) return res.status(502).json({ error: "Database se jawab nahi aaya." });
+    if (r.data && r.data.error === "auth") return res.status(401).json({ error: "Login dobara karo." });
+    res.setHeader("Cache-Control", "no-store");
+    res.json(Object.assign({ payments: { keyVar: RZP_ID ? RZP_ID.name : null, secretVar: RZP_SECRET ? RZP_SECRET.name : null,
+      webhook: !!RZP_WEBHOOK, test: !!(RZP_ID && /^rzp_test_/.test(RZP_ID.value)), adminPass: !!ENV_PASS } }, r.data));
+  } catch (err) { res.status(502).json({ error: "Database tak nahi pahunch paye." }); }
+});
+app.post("/admin/tools", express.json({ limit: "64kb" }), async (req, res) => {
+  const rows = Array.isArray((req.body || {}).tools) ? req.body.tools : null;
+  if (!rows) return res.status(400).json({ error: "Kuch save karne ko nahi mila." });
+  try {
+    const r = await rpc("pb_admin_tools_save", { p_token: bearer(req), p_rows: rows });
+    const d = r.data || {};
+    if (!r.ok) return res.status(502).json({ error: "Database se jawab nahi aaya." });
+    if (d.error === "auth") return res.status(401).json({ error: "Login dobara karo." });
+    if (d.error === "price") return res.status(400).json({ error: "Paid tool ka offer price kam se kam ₹1 hona chahiye (" + d.tool + ")." });
+    if (d.error) return res.status(400).json({ error: "Save nahi hua." });
+    paidCache = { at: 0, data: null };
+    res.json(d);
+  } catch (err) { res.status(502).json({ error: "Database tak nahi pahunch paye." }); }
 });
 
 // multer / generic error handler (keeps failures as clean JSON, never a raw crash page)
