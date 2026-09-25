@@ -179,28 +179,31 @@ app.post("/pdf/protect", upload.single("file"), async (req, res) => {
 // one-way hash of IP + browser + today's date, so the same person counts
 // once a day and cannot be followed from one day to the next.
 //
-// Needs two environment variables on Render (never in this file — the repo
-// is public):
-//   SUPABASE_SERVICE_KEY  the project's service_role / secret key
-//   ADMIN_PASSWORD        the admin panel password   (ADMIN_USER, default "admin")
-// Without them tracking is skipped and the admin panel says what is missing.
+// Everything lives in the Supabase project "PDF Banao" (banaopdf-tech's
+// org). The backend talks to it with the project's PUBLISHABLE key, which is
+// meant to be public: the tables themselves are closed, and the only way in is
+// a handful of database functions (pb_track, pb_admin_login, pb_admin_stats,
+// pb_admin_password, pb_admin_logout) that do their own checks. The admin
+// password is a bcrypt hash inside the database and is changed from the admin
+// panel — nothing secret has to be set on Render.
 // ======================================================================
 const geoCountry = require("geoip-country");  // IPv4 + IPv6, country only, ~13 MB of memory
 const geoCity = require("fast-geoip");        // IPv4 state/city, read lazily from disk
 
-const SUPABASE_URL = (process.env.SUPABASE_URL || "https://csrzyikbmtmhkmjbbpio.supabase.co").replace(/\/+$/, "");
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
-const ADMIN_USER = process.env.ADMIN_USER || "admin";
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
+const SUPABASE_URL = (process.env.SUPABASE_URL || "https://jbzssifupzyazzddgwjl.supabase.co").replace(/\/+$/, "");
+const SUPABASE_KEY = process.env.SUPABASE_KEY || "sb_publishable_QPkf2-orVWYG5JML-yHp_w_5rFa6FMi";
 const STATS_TZ = "Asia/Kolkata";
 
-function supabase(pathname, body, prefer) {
+/* call one of the database functions; resolves to { ok, status, data } */
+async function rpc(name, args) {
   const headers = { "Content-Type": "application/json", apikey: SUPABASE_KEY };
-  if (prefer) headers.Prefer = prefer;
-  // legacy service_role keys are JWTs and go in Authorization too; the newer
-  // sb_secret_ keys must only be sent as apikey
+  // legacy keys are JWTs and go in Authorization too; sb_publishable_ keys only as apikey
   if (/^eyJ/.test(SUPABASE_KEY)) headers.Authorization = "Bearer " + SUPABASE_KEY;
-  return fetch(SUPABASE_URL + pathname, { method: "POST", headers, body: JSON.stringify(body) });
+  const r = await fetch(SUPABASE_URL + "/rest/v1/rpc/" + name, { method: "POST", headers, body: JSON.stringify(args) });
+  const text = await r.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (e) { data = text; }
+  return { ok: r.ok, status: r.status, data };
 }
 
 const IN_STATES = {
@@ -273,13 +276,6 @@ function sourceOf(refHost, utmSource, ownHost) {
   return h.replace(/^www\./, "").slice(0, 60);
 }
 
-/* a visitor code that is the same all day and useless tomorrow */
-function visitorOf(ip, ua) {
-  const day = new Date(Date.now() + 5.5 * 3600e3).toISOString().slice(0, 10);   // IST date
-  const salt = crypto.createHmac("sha256", "pb-visitor|" + SUPABASE_KEY).update(day).digest();
-  return crypto.createHmac("sha256", salt).update(ip + "|" + ua).digest("hex").slice(0, 20);
-}
-
 /* per-IP limits, in memory: enough to stop a loop or a password guesser */
 const hits = new Map();
 function tooMany(key, max, windowMs) {
@@ -296,7 +292,6 @@ const cut = (v, n) => (v == null || v === "" ? null : String(v).slice(0, n));
 app.post("/t", express.text({ type: "*/*", limit: "4kb" }), async (req, res) => {
   res.status(204).end();                      // the visitor never waits for any of this
   try {
-    if (!SUPABASE_KEY) return;
     const ua = String(req.headers["user-agent"] || "");
     if (isBot(ua)) return;
     const ip = clientIp(req);
@@ -328,45 +323,58 @@ app.post("/t", express.text({ type: "*/*", limit: "4kb" }), async (req, res) => 
       country: place.country, region: cut(place.region, 80), city: cut(place.city, 80),
       device: agent.device, browser: agent.browser, os: agent.os,
       lang: cut(d.l, 20), screen: cut(d.s && /^\d{2,5}x\d{2,5}$/.test(String(d.s)) ? d.s : null, 20),
-      visitor: visitorOf(ip, ua),
     };
-    const r = await supabase("/rest/v1/pb_visits", row, "return=minimal");
-    if (!r.ok) console.error("stats insert failed", r.status, (await r.text()).slice(0, 200));
+    // the IP and browser go along only to make the daily visitor code in the
+    // database (with a salt that never leaves it); neither is stored
+    const r = await rpc("pb_track", { p: row, p_ip: ip, p_ua: ua });
+    if (!r.ok) console.error("stats insert failed", r.status, JSON.stringify(r.data).slice(0, 200));
   } catch (err) {
     console.error("stats error", err && err.message);
   }
 });
 
-/* ---- admin: login gives a signed token that lasts 12 hours ---- */
-const tokenKey = () => crypto.createHash("sha256").update("pb-admin|" + ADMIN_PASSWORD + "|" + SUPABASE_KEY).digest();
-const b64u = (buf) => Buffer.from(buf).toString("base64").replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
-function makeToken() {
-  const payload = b64u(JSON.stringify({ u: ADMIN_USER, exp: Date.now() + 12 * 3600e3 }));
-  return payload + "." + b64u(crypto.createHmac("sha256", tokenKey()).update(payload).digest());
-}
-function tokenOk(tok) {
-  if (!ADMIN_PASSWORD || !tok) return false;
-  const [payload, sig] = String(tok).split(".");
-  if (!payload || !sig) return false;
-  const want = b64u(crypto.createHmac("sha256", tokenKey()).update(payload).digest());
-  if (want.length !== sig.length || !crypto.timingSafeEqual(Buffer.from(want), Buffer.from(sig))) return false;
-  try { return JSON.parse(Buffer.from(payload, "base64").toString()).exp > Date.now(); } catch (e) { return false; }
-}
-const sameSecret = (a, b) => crypto.timingSafeEqual(
-  crypto.createHash("sha256").update(String(a)).digest(), crypto.createHash("sha256").update(String(b)).digest());
+/* ---- admin panel ---- */
+const bearer = (req) => String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").slice(0, 200);
 
-app.get("/admin/status", (req, res) => res.json({ password: !!ADMIN_PASSWORD, database: !!SUPABASE_KEY }));
+app.get("/admin/status", (req, res) => res.json({ password: true, database: !!SUPABASE_KEY }));
 
-app.post("/admin/login", express.json({ limit: "2kb" }), (req, res) => {
+app.post("/admin/login", express.json({ limit: "2kb" }), async (req, res) => {
   const ip = clientIp(req);
-  if (!ADMIN_PASSWORD) return res.status(503).json({ error: "ADMIN_PASSWORD Render par set nahi hai." });
   if (tooMany("login|" + ip, 8, 15 * 60e3)) return res.status(429).json({ error: "Bahut baar galat try hua. 15 minute baad dobara karo." });
   const { user, password } = req.body || {};
-  if (!sameSecret(user || "", ADMIN_USER) || !sameSecret(password || "", ADMIN_PASSWORD)) {
-    return res.status(401).json({ error: "Username ya password galat hai." });
+  try {
+    const r = await rpc("pb_admin_login", { p_user: String(user || "").slice(0, 60), p_pass: String(password || "").slice(0, 100) });
+    const d = r.data || {};
+    if (!r.ok) return res.status(502).json({ error: "Database se jawab nahi aaya (" + r.status + ")." });
+    if (d.error === "locked") return res.status(429).json({ error: "Bahut baar galat password dala gaya. 15 minute baad try karo." });
+    if (d.error || !d.token) return res.status(401).json({ error: "Username ya password galat hai." });
+    hits.delete("login|" + ip);
+    res.json({ token: d.token, user: d.user, mustChange: !!d.must_change });
+  } catch (err) {
+    res.status(502).json({ error: "Database tak nahi pahunch paye." });
   }
-  hits.delete("login|" + ip);
-  res.json({ token: makeToken(), user: ADMIN_USER });
+});
+
+app.post("/admin/password", express.json({ limit: "2kb" }), async (req, res) => {
+  const ip = clientIp(req);
+  if (tooMany("pw|" + ip, 10, 15 * 60e3)) return res.status(429).json({ error: "Bahut baar try hua. 15 minute baad dobara karo." });
+  const { oldPassword, newPassword } = req.body || {};
+  try {
+    const r = await rpc("pb_admin_password", { p_token: bearer(req), p_old: String(oldPassword || ""), p_new: String(newPassword || "") });
+    const d = r.data || {};
+    if (!r.ok) return res.status(502).json({ error: "Database se jawab nahi aaya (" + r.status + ")." });
+    const why = { auth: [401, "Login dobara karo."], old: [400, "Purana password galat hai."],
+      length: [400, "Naya password 8 se 72 akshar ka hona chahiye."], same: [400, "Naya password purane se alag hona chahiye."] };
+    if (d.error) { const [code, msg] = why[d.error] || [400, "Password nahi badla."]; return res.status(code).json({ error: msg }); }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(502).json({ error: "Database tak nahi pahunch paye." });
+  }
+});
+
+app.post("/admin/logout", async (req, res) => {
+  try { await rpc("pb_admin_logout", { p_token: bearer(req) }); } catch (e) {}
+  res.json({ ok: true });
 });
 
 /* the time range, in Indian time: today, yesterday, or the last N days */
@@ -374,30 +382,31 @@ function rangeOf(q) {
   const IST = 5.5 * 3600e3;
   const now = Date.now();
   const midnight = Math.floor((now + IST) / 86400e3) * 86400e3 - IST;   // today 00:00 IST, as UTC ms
+  // "up to now" ends a few minutes ahead, so a server clock running slightly
+  // behind the database's never hides the visits that just came in
+  const soon = now + 5 * 60e3;
   const r = String(q.range || "7d");
-  if (r === "today") return [midnight, now];
+  if (r === "today") return [midnight, soon];
   if (r === "yesterday") return [midnight - 86400e3, midnight];
   if (/^\d{4}-\d{2}-\d{2}$/.test(String(q.from || "")) && /^\d{4}-\d{2}-\d{2}$/.test(String(q.to || ""))) {
     const f = Date.parse(q.from + "T00:00:00+05:30"), t = Date.parse(q.to + "T00:00:00+05:30") + 86400e3;
-    if (t > f && t - f <= 400 * 86400e3) return [f, Math.min(t, now)];
+    if (t > f && t - f <= 400 * 86400e3) return [f, Math.min(t, soon)];
   }
   const days = Math.min(365, Math.max(1, parseInt(r, 10) || 7));
-  return [midnight - (days - 1) * 86400e3, now];
+  return [midnight - (days - 1) * 86400e3, soon];
 }
 
 app.get("/admin/stats", async (req, res) => {
-  const tok = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  if (!tokenOk(tok)) return res.status(401).json({ error: "Login dobara karo." });
-  if (!SUPABASE_KEY) return res.status(503).json({ error: "SUPABASE_SERVICE_KEY Render par set nahi hai." });
   const [from, to] = rangeOf(req.query);
   try {
-    const r = await supabase("/rest/v1/rpc/pb_stats", {
-      p_from: new Date(from).toISOString(), p_to: new Date(to).toISOString(), p_tz: STATS_TZ,
+    const r = await rpc("pb_admin_stats", {
+      p_token: bearer(req), p_from: new Date(from).toISOString(), p_to: new Date(to).toISOString(), p_tz: STATS_TZ,
     });
-    const text = await r.text();
     if (!r.ok) return res.status(502).json({ error: "Database se data nahi aaya (" + r.status + ")." });
+    if (r.data && r.data.error === "auth") return res.status(401).json({ error: "Login dobara karo." });
+    if (!r.data || r.data.error) return res.status(400).json({ error: "Ye samay-seema nahi chal sakti." });
     res.setHeader("Cache-Control", "no-store");
-    res.type("application/json").send(text);
+    res.json(r.data);
   } catch (err) {
     res.status(502).json({ error: "Database tak nahi pahunch paye." });
   }
