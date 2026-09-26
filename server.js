@@ -20,6 +20,39 @@ const crypto = require("crypto");
 const app = express();
 app.use(cors());
 
+/* health counters for the admin panel, in memory only (reset on restart).
+   Never holds query strings, bodies, headers, tokens, IPs or emails. */
+const health = {
+  startTime: Date.now(), requestsTotal: 0, routes: {}, errorsRecent: [],
+  payments: { order_fail: 0, verify_fail: 0, recent: [] },
+};
+const pushCapped = (list, item, max) => { list.push(item); if (list.length > max) list.splice(0, list.length - max); };
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    try {
+      // matched routes use their pattern (/convert/from-pdf/:target); anything
+      // else its bare path, with a cap so scanners cannot grow the map forever
+      let route = String((req.route && req.route.path) || req.path || "?").slice(0, 100);
+      if (!health.routes[route] && Object.keys(health.routes).length >= 200) route = "(other)";
+      const e = health.routes[route] || (health.routes[route] = { count: 0, errors: 0, slow: 0 });
+      health.requestsTotal++;
+      e.count++;
+      if (res.statusCode >= 500) {
+        e.errors++;
+        pushCapped(health.errorsRecent, { ts: Date.now(), route, message: (res.statusCode + " " + route).slice(0, 200) }, 20);
+      }
+      if (Date.now() - start > 2000) e.slow++;
+    } catch (err) {}
+  });
+  next();
+});
+/* a payment step that failed; reason is always a short fixed label */
+function payFail(stage, reason) {
+  if (stage === "order") health.payments.order_fail++; else health.payments.verify_fail++;
+  pushCapped(health.payments.recent, { ts: Date.now(), stage, reason: String(reason).slice(0, 200) }, 10);
+}
+
 const MAX_FILE_BYTES = 25 * 1024 * 1024; // 25MB — generous for office docs, keeps free-tier memory safe
 const upload = multer({ dest: os.tmpdir(), limits: { fileSize: MAX_FILE_BYTES } });
 
@@ -325,7 +358,7 @@ app.post("/t", express.text({ type: "*/*", limit: "4kb" }), async (req, res) => 
     if (tooMany("t|" + ip, 120, 60e3)) return;
     let d;
     try { d = JSON.parse(req.body || "{}"); } catch (e) { return; }
-    if (!d || (d.k !== "page" && d.k !== "tool")) return;
+    if (!d || (d.k !== "page" && d.k !== "tool" && d.k !== "paywall")) return;
 
     let ownHost = null;
     try { ownHost = new URL(String(d.u || "")).host.toLowerCase(); } catch (e) {}
@@ -478,6 +511,64 @@ app.get("/admin/stats", async (req, res) => {
   }
 });
 
+/* ---- admin reports: same checks and messages as /admin/stats ---- */
+async function adminReport(res, name, args) {
+  try {
+    const r = await rpc(name, args);
+    if (!r.ok) return res.status(502).json({ error: "Database se data nahi aaya (" + r.status + ")." });
+    if (r.data && r.data.error === "auth") return res.status(401).json({ error: "Login dobara karo." });
+    if (!r.data || r.data.error) return res.status(400).json({ error: "Ye samay-seema nahi chal sakti." });
+    res.setHeader("Cache-Control", "no-store");
+    res.json(r.data);
+  } catch (err) {
+    res.status(502).json({ error: "Database tak nahi pahunch paye." });
+  }
+}
+/* search text and paging for the order / user lists */
+function pageOf(q) {
+  const limit = parseInt(q.limit, 10), offset = parseInt(q.offset, 10);
+  return {
+    p_q: String(q.q || "").slice(0, 100),
+    p_limit: Number.isFinite(limit) ? Math.min(200, Math.max(1, limit)) : 50,
+    p_offset: Number.isFinite(offset) ? Math.max(0, offset) : 0,
+  };
+}
+const isoRange = (q) => { const [from, to] = rangeOf(q); return { p_from: new Date(from).toISOString(), p_to: new Date(to).toISOString() }; };
+
+app.get("/admin/revenue", (req, res) =>
+  adminReport(res, "pb_admin_revenue", Object.assign({ p_token: bearer(req) }, isoRange(req.query), { p_tz: STATS_TZ })));
+app.get("/admin/orders", (req, res) => {
+  const status = ["all", "paid", "pending"].includes(req.query.status) ? req.query.status : "all";
+  const pg = pageOf(req.query);
+  adminReport(res, "pb_admin_orders", Object.assign({ p_token: bearer(req) }, isoRange(req.query),
+    { p_status: status, p_q: pg.p_q, p_limit: pg.p_limit, p_offset: pg.p_offset }));
+});
+app.get("/admin/recover", (req, res) =>
+  adminReport(res, "pb_admin_recover", Object.assign({ p_token: bearer(req) }, isoRange(req.query))));
+app.get("/admin/users", (req, res) =>
+  adminReport(res, "pb_admin_users", Object.assign({ p_token: bearer(req) }, pageOf(req.query))));
+app.get("/admin/funnel", (req, res) =>
+  adminReport(res, "pb_admin_funnel", Object.assign({ p_token: bearer(req) }, isoRange(req.query), { p_tz: STATS_TZ })));
+app.get("/admin/utm", (req, res) =>
+  adminReport(res, "pb_admin_utm", Object.assign({ p_token: bearer(req) }, isoRange(req.query))));
+app.get("/admin/growth", (req, res) =>
+  adminReport(res, "pb_admin_growth", Object.assign({ p_token: bearer(req) }, isoRange(req.query), { p_tz: STATS_TZ })));
+
+/* server health: the in-memory counters above, for a logged-in admin */
+app.get("/admin/health", async (req, res) => {
+  try {
+    const r = await rpc("pb_admin_ok", { p_token: bearer(req) });
+    if (!r.ok || r.data !== true) return res.status(401).json({ error: "Login dobara karo." });
+    res.setHeader("Cache-Control", "no-store");
+    res.json({
+      uptime_sec: Math.round((Date.now() - health.startTime) / 1000), memory: process.memoryUsage(),
+      requests_total: health.requestsTotal, routes: health.routes, errors_recent: health.errorsRecent, payments: health.payments,
+    });
+  } catch (err) {
+    res.status(502).json({ error: "Database tak nahi pahunch paye." });
+  }
+});
+
 // ======================================================================
 // Paid tools, user accounts and Razorpay
 // ----------------------------------------------------------------------
@@ -587,24 +678,25 @@ function razorpay(pathname, body) {
 
 app.post("/pay/order", express.json({ limit: "2kb" }), async (req, res) => {
   const ip = clientIp(req);
-  if (tooMany("order|" + ip, 20, 15 * 60e3)) return res.status(429).json({ error: "Thodi der baad try karo." });
-  if (!payReady()) return res.status(503).json({ error: "Payment abhi band hai — admin ko Render par Razorpay keys daalni hain." });
-  if (!ENV_PASS) return res.status(503).json({ error: "Payment abhi band hai — Render par ADMIN_PASSWORD chahiye." });
+  if (tooMany("order|" + ip, 20, 15 * 60e3)) { payFail("order", "rate_limit"); return res.status(429).json({ error: "Thodi der baad try karo." }); }
+  if (!payReady()) { payFail("order", "not_ready"); return res.status(503).json({ error: "Payment abhi band hai — admin ko Render par Razorpay keys daalni hain." }); }
+  if (!ENV_PASS) { payFail("order", "no_admin_pass"); return res.status(503).json({ error: "Payment abhi band hai — Render par ADMIN_PASSWORD chahiye." }); }
   const tool = String((req.body || {}).tool || "").slice(0, 60);
   const kind = (req.body || {}).kind === "once" ? "once" : "pass";
   const receipt = "pb_" + Date.now().toString(36) + crypto.randomBytes(5).toString("hex");
   try {
     const st = await rpc("pb_order_start", { p_key: dbKey(), p_user_token: bearer(req), p_tool: tool, p_receipt: receipt, p_kind: kind });
     const d = st.data || {};
-    if (!st.ok) return res.status(502).json({ error: "Server se jawab nahi aaya." });
-    if (d.error === "auth") return res.status(401).json({ error: USER_ERRORS.auth });
-    if (d.error === "key") return res.status(503).json({ error: "Payment abhi setup ho raha hai — admin ko ek baar admin panel me login karna hai." });
-    if (d.error === "kind") return res.status(400).json({ error: "Is tool ke liye ye option abhi nahi hai." });
-    if (d.error) return res.status(400).json({ error: "Ye tool abhi paid nahi hai." });
+    if (!st.ok) { payFail("order", "db:down"); return res.status(502).json({ error: "Server se jawab nahi aaya." }); }
+    if (d.error === "auth") { payFail("order", "db:auth"); return res.status(401).json({ error: USER_ERRORS.auth }); }
+    if (d.error === "key") { payFail("order", "db:key"); return res.status(503).json({ error: "Payment abhi setup ho raha hai — admin ko ek baar admin panel me login karna hai." }); }
+    if (d.error === "kind") { payFail("order", "db:kind"); return res.status(400).json({ error: "Is tool ke liye ye option abhi nahi hai." }); }
+    if (d.error) { payFail("order", "db:tool"); return res.status(400).json({ error: "Ye tool abhi paid nahi hai." }); }
     const rz = await razorpay("/orders", { amount: d.amount, currency: "INR", receipt, notes: { tool, kind, email: d.user.email } });
     const order = await rz.json().catch(() => ({}));
     if (!rz.ok || !order.id) {
       console.error("razorpay order failed", rz.status, JSON.stringify(order).slice(0, 300));
+      payFail("order", "razorpay_order");
       return res.status(502).json({ error: rz.status === 401 ? "Razorpay keys galat hain (admin check kare)." : "Razorpay se order nahi bana. Dobara try karo." });
     }
     await rpc("pb_order_attach", { p_key: dbKey(), p_receipt: receipt, p_order_id: order.id });
@@ -612,6 +704,7 @@ app.post("/pay/order", express.json({ limit: "2kb" }), async (req, res) => {
       kind, period: d.period, user: d.user });
   } catch (err) {
     console.error("order error", err && err.message);
+    payFail("order", "exception");
     res.status(502).json({ error: "Payment shuru nahi ho paya. Dobara try karo." });
   }
 });
@@ -627,6 +720,7 @@ app.post("/pay/verify", express.json({ limit: "2kb" }), async (req, res) => {
   const b = req.body || {};
   const orderId = String(b.orderId || "").slice(0, 60), paymentId = String(b.paymentId || "").slice(0, 60);
   if (!signatureOk(orderId, paymentId, String(b.signature || "").slice(0, 200))) {
+    payFail("verify", "bad_signature");
     return res.status(400).json({ error: "Payment ki pushti nahi hui. Paise kate hon to humein email karo — hum jod denge." });
   }
   try {
@@ -634,11 +728,13 @@ app.post("/pay/verify", express.json({ limit: "2kb" }), async (req, res) => {
     const d = r.data || {};
     if (!r.ok || d.error) {
       console.error("order paid failed", r.status, JSON.stringify(d).slice(0, 200));
+      payFail("verify", "grant_failed");
       return res.status(502).json({ error: "Payment mil gaya, par account me judne me dikkat hui. Humein email karo — hum jod denge." });
     }
     const me = await rpc("pb_user_me", { p_token: bearer(req) });
     res.json({ ok: true, tool: d.tool, kind: d.kind, subs: (me.data && me.data.subs) || d.subs || [] });
   } catch (err) {
+    payFail("verify", "exception");
     res.status(502).json({ error: "Payment mil gaya, par account me judne me dikkat hui. Thodi der me dobara try karo." });
   }
 });
