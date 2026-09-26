@@ -24,7 +24,7 @@ app.use(cors());
    Never holds query strings, bodies, headers, tokens, IPs or emails. */
 const health = {
   startTime: Date.now(), requestsTotal: 0, routes: {}, errorsRecent: [],
-  payments: { order_fail: 0, verify_fail: 0, recent: [] },
+  payments: { order_ok: 0, order_fail: 0, verify_ok: 0, verify_fail: 0, recent: [] },
 };
 const pushCapped = (list, item, max) => { list.push(item); if (list.length > max) list.splice(0, list.length - max); };
 app.use((req, res, next) => {
@@ -51,6 +51,10 @@ app.use((req, res, next) => {
 function payFail(stage, reason) {
   if (stage === "order") health.payments.order_fail++; else health.payments.verify_fail++;
   pushCapped(health.payments.recent, { ts: Date.now(), stage, reason: String(reason).slice(0, 200) }, 10);
+}
+/* a payment step that succeeded */
+function payOk(stage) {
+  if (stage === "order") health.payments.order_ok++; else health.payments.verify_ok++;
 }
 
 const MAX_FILE_BYTES = 25 * 1024 * 1024; // 25MB — generous for office docs, keeps free-tier memory safe
@@ -560,9 +564,17 @@ app.get("/admin/health", async (req, res) => {
     const r = await rpc("pb_admin_ok", { p_token: bearer(req) });
     if (!r.ok || r.data !== true) return res.status(401).json({ error: "Login dobara karo." });
     res.setHeader("Cache-Control", "no-store");
+    const mem = process.memoryUsage();
+    const routes = Object.keys(health.routes).map((route) => {
+      const s = health.routes[route] || {};
+      return { route, hits: s.count || 0, errors: s.errors || 0, slow: s.slow || 0 };
+    }).sort((a, b) => b.hits - a.hits);
     res.json({
-      uptime_sec: Math.round((Date.now() - health.startTime) / 1000), memory: process.memoryUsage(),
-      requests_total: health.requestsTotal, routes: health.routes, errors_recent: health.errorsRecent, payments: health.payments,
+      uptime_sec: Math.round((Date.now() - health.startTime) / 1000),
+      memory: { rss_mb: mem.rss / 1048576, heap_mb: mem.heapUsed / 1048576 },
+      requests_total: health.requestsTotal, routes,
+      errors_recent: health.errorsRecent.map((e) => ({ ts: e.ts, route: e.route, msg: e.message })),
+      payments: health.payments,
     });
   } catch (err) {
     res.status(502).json({ error: "Database tak nahi pahunch paye." });
@@ -700,6 +712,7 @@ app.post("/pay/order", express.json({ limit: "2kb" }), async (req, res) => {
       return res.status(502).json({ error: rz.status === 401 ? "Razorpay keys galat hain (admin check kare)." : "Razorpay se order nahi bana. Dobara try karo." });
     }
     await rpc("pb_order_attach", { p_key: dbKey(), p_receipt: receipt, p_order_id: order.id });
+    payOk("order");
     res.json({ orderId: order.id, amount: d.amount, currency: "INR", keyId: RZP_ID.value, toolName: d.toolName,
       kind, period: d.period, user: d.user });
   } catch (err) {
@@ -732,6 +745,7 @@ app.post("/pay/verify", express.json({ limit: "2kb" }), async (req, res) => {
       return res.status(502).json({ error: "Payment mil gaya, par account me judne me dikkat hui. Humein email karo — hum jod denge." });
     }
     const me = await rpc("pb_user_me", { p_token: bearer(req) });
+    payOk("verify");
     res.json({ ok: true, tool: d.tool, kind: d.kind, subs: (me.data && me.data.subs) || d.subs || [] });
   } catch (err) {
     payFail("verify", "exception");
