@@ -362,7 +362,17 @@ app.post("/t", express.text({ type: "*/*", limit: "4kb" }), async (req, res) => 
     if (tooMany("t|" + ip, 120, 60e3)) return;
     let d;
     try { d = JSON.parse(req.body || "{}"); } catch (e) { return; }
-    if (!d || (d.k !== "page" && d.k !== "tool" && d.k !== "paywall")) return;
+    if (!d || (d.k !== "page" && d.k !== "tool" && d.k !== "paywall" && d.k !== "vote")) return;
+
+    if (d.k === "vote") {
+      var vtool = /^[a-z0-9-]{1,60}$/.test(String(d.tool || "")) ? String(d.tool) : null;
+      var vv = (d.v === "up" || d.v === "down") ? d.v : null;
+      if (!vtool || !vv) return;
+      if (tooMany("vote|" + ip, 30, 60e3)) return;
+      var vr = await rpc("pb_vote", { p: { tool: vtool, vote: vv }, p_ip: ip, p_ua: ua });
+      if (!vr.ok) console.error("vote insert failed", vr.status);
+      return;
+    }
 
     let ownHost = null;
     try { ownHost = new URL(String(d.u || "")).host.toLowerCase(); } catch (e) {}
@@ -508,6 +518,18 @@ app.get("/admin/stats", async (req, res) => {
     if (!r.ok) return res.status(502).json({ error: "Database se data nahi aaya (" + r.status + ")." });
     if (r.data && r.data.error === "auth") return res.status(401).json({ error: "Login dobara karo." });
     if (!r.data || r.data.error) return res.status(400).json({ error: "Ye samay-seema nahi chal sakti." });
+    res.setHeader("Cache-Control", "no-store");
+    res.json(r.data);
+  } catch (err) {
+    res.status(502).json({ error: "Database tak nahi pahunch paye." });
+  }
+});
+
+app.get("/admin/votes", async (req, res) => {
+  try {
+    const r = await rpc("pb_admin_votes", { p_token: bearer(req) });
+    if (!r.ok) return res.status(502).json({ error: "Database se data nahi aaya (" + r.status + ")." });
+    if (r.data && r.data.error === "auth") return res.status(401).json({ error: "Login dobara karo." });
     res.setHeader("Cache-Control", "no-store");
     res.json(r.data);
   } catch (err) {
