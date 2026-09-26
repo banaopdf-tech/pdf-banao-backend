@@ -101,12 +101,12 @@ app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 // ---- Office document -> PDF (Word/PowerPoint/Excel/Text/RTF -> PDF) ----
 app.post("/convert/to-pdf", upload.single("file"), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  if (!req.file) return res.status(400).json({ error: "Koi file upload nahi hui. Dobara try karo." });
   const allowedExt = [".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".rtf", ".txt", ".odt", ".odp", ".ods"];
   const ext = safeExt(req.file.originalname);
   if (!allowedExt.includes(ext)) {
     cleanup(null, req.file.path);
-    return res.status(400).json({ error: `Unsupported file type "${ext}". Supported: Word, PowerPoint, Excel, RTF, TXT, ODT/ODP/ODS.` });
+    return res.status(400).json({ error: `Ye file type supported nahi hai ("${ext}"). Sirf Word, PowerPoint, Excel, RTF, TXT, ODT, ODP ya ODS file daalo.` });
   }
   const workDir = newWorkDir("to-pdf");
   try {
@@ -144,11 +144,11 @@ const PDF_TARGETS = {
 };
 app.post("/convert/from-pdf/:target", upload.single("file"), async (req, res) => {
   const target = PDF_TARGETS[req.params.target];
-  if (!target) return res.status(400).json({ error: "Unsupported target format" });
-  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  if (!target) return res.status(400).json({ error: "Ye format supported nahi hai." });
+  if (!req.file) return res.status(400).json({ error: "Koi file upload nahi hui. Dobara try karo." });
   if (safeExt(req.file.originalname) !== ".pdf") {
     cleanup(null, req.file.path);
-    return res.status(400).json({ error: "Please upload a PDF file." });
+    return res.status(400).json({ error: "Sirf PDF file upload karo." });
   }
   const workDir = newWorkDir("from-pdf");
   try {
@@ -168,14 +168,14 @@ app.post("/convert/from-pdf/:target", upload.single("file"), async (req, res) =>
 
 // ---- Unlock PDF (remove a KNOWN password) ----
 app.post("/pdf/unlock", upload.single("file"), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  if (!req.file) return res.status(400).json({ error: "Koi file upload nahi hui. Dobara try karo." });
   const password = req.body.password || "";
   const workDir = newWorkDir("unlock");
   const outputPath = path.join(workDir, "unlocked.pdf");
   execFile("qpdf", [`--password=${password}`, "--decrypt", req.file.path, outputPath], { timeout: 20000 }, (err, stdout, stderr) => {
     if (err) {
       cleanup(workDir, req.file.path);
-      const msg = /invalid password|failed to open/i.test(stderr || "") ? "Incorrect PDF password." : "Could not unlock this PDF.";
+      const msg = /invalid password|failed to open/i.test(stderr || "") ? "Password galat hai. Sahi password daalkar dobara try karo." : "Ye PDF unlock nahi ho paya. File kharab ho sakti hai.";
       return res.status(400).json({ error: msg });
     }
     res.setHeader("Content-Type", "application/pdf");
@@ -186,18 +186,18 @@ app.post("/pdf/unlock", upload.single("file"), async (req, res) => {
 
 // ---- Protect PDF (add a password) ----
 app.post("/pdf/protect", upload.single("file"), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  if (!req.file) return res.status(400).json({ error: "Koi file upload nahi hui. Dobara try karo." });
   const password = req.body.password;
   if (!password || String(password).length < 1) {
     cleanup(null, req.file.path);
-    return res.status(400).json({ error: "A password is required." });
+    return res.status(400).json({ error: "Password daalna zaroori hai." });
   }
   const workDir = newWorkDir("protect");
   const outputPath = path.join(workDir, "protected.pdf");
   execFile("qpdf", ["--encrypt", password, password, "256", "--", req.file.path, outputPath], { timeout: 20000 }, (err, stdout, stderr) => {
     if (err) {
       cleanup(workDir, req.file.path);
-      return res.status(500).json({ error: "Could not protect this PDF: " + (stderr || "").slice(0, 200) });
+      return res.status(500).json({ error: "PDF protect nahi ho paya: " + (stderr || "").slice(0, 200) });
     }
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", 'attachment; filename="protected.pdf"');
